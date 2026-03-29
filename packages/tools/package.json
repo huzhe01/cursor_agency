@@ -1,0 +1,11 @@
+{
+  "name": "@agency/tools",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "diff": "^8.0.2"
+  }
+}

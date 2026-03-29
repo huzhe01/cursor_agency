@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "@agency/core": ["packages/core/src/index.ts"],
+      "@agency/indexer": ["packages/indexer/src/index.ts"],
+      "@agency/tools": ["packages/tools/src/index.ts"]
+    },
+    "resolveJsonModule": true,
+    "declaration": false,
+    "outDir": "dist"
+  },
+  "include": [
+    "apps/**/*.ts",
+    "packages/**/*.ts",
+    "scripts/**/*.ts"
+  ]
+}

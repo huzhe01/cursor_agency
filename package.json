@@ -1,0 +1,25 @@
+{
+  "name": "cursor-agency",
+  "private": true,
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "bootstrap": "pnpm install && pnpm rebuild esbuild && (cd packages/indexer && npm rebuild better-sqlite3 --build-from-source)",
+    "agency": "tsx apps/cli/src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/diff": "^7.0.1",
+    "@types/node": "^24.5.2",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "@agency/cli",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@agency/core": "workspace:*",
+    "commander": "^14.0.1",
+    "dotenv": "^16.6.1"
+  }
+}

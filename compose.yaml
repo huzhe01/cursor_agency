@@ -1,0 +1,27 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    init: true
+    tty: true
+    stdin_open: true
+    user: "${HOST_UID:-501}:${HOST_GID:-20}"
+    env_file:
+      - path: .env.local
+        required: false
+    environment:
+      HOME: /workspace/.cache/home
+      XDG_CACHE_HOME: /workspace/.cache/xdg
+      PNPM_HOME: /workspace/.cache/pnpm/home
+      PNPM_STORE_DIR: /workspace/.cache/pnpm/store
+      NPM_CONFIG_CACHE: /workspace/.cache/npm
+      UV_CACHE_DIR: /workspace/.cache/uv
+      PLAYWRIGHT_BROWSERS_PATH: /workspace/.cache/playwright
+      AGENCY_ROOT: /workspace
+      AGENCY_STATE_DIR: /workspace/.agency
+    volumes:
+      - .:/workspace
+    ports:
+      - "3000:3000"

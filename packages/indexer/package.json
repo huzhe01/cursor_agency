@@ -1,0 +1,12 @@
+{
+  "name": "@agency/indexer",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.4.1",
+    "chokidar": "^4.0.3"
+  }
+}
