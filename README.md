@@ -114,6 +114,8 @@ The runtime also accepts `OPENAI_*` variables directly when using Ark's OpenAI-c
 
 Optional verifier/backend settings:
 
+
+
 ```env
 VERIFIER_API_KEY=
 VERIFIER_MODEL=
