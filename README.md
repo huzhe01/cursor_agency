@@ -13,9 +13,10 @@ The runtime is designed around a simple software engineering workflow:
 - A containerized development/runtime environment
 - A local code index built on `SQLite FTS + embedding rerank`
 - A verifier-driven agent runtime with approvals for write and shell actions
+- Budget-driven single-session context management with rolling summaries
 - A persistent session/artifact store under `.agency/`
 - A CLI for task execution and interactive chat
-- A minimal web console for sessions, diff preview, and approval handling
+- A minimal web console for sessions, diff preview, approval handling, and SSE streaming
 - Local Python + DuckDB analysis execution inside the containerized runtime
 
 ## Host Compatibility
@@ -118,6 +119,10 @@ VERIFIER_API_KEY=
 VERIFIER_MODEL=
 VERIFIER_BASE_URL=
 AGENCY_MAX_EXECUTION_ROUNDS=3
+AGENCY_CONTEXT_TOKEN_BUDGET=12000
+AGENCY_CONTEXT_RESERVE_TOKENS=2500
+AGENCY_TOOL_OUTPUT_CHAR_LIMIT=3500
+AGENCY_SUMMARY_TRIGGER_RATIO=0.8
 AGENCY_DEFAULT_BACKEND=local
 E2B_API_KEY=
 E2B_TEMPLATE_ID=
@@ -284,6 +289,8 @@ Responsibilities:
 
 - configuration loading
 - provider/model adapter
+- runtime event streaming
+- context budgeting and rolling summary generation
 - session persistence
 - approval queueing
 - task/chat runtime loop
@@ -292,6 +299,8 @@ Responsibilities:
 Important files:
 
 - `packages/core/src/config.ts`
+- `packages/core/src/context.ts`
+- `packages/core/src/events.ts`
 - `packages/core/src/openai.ts`
 - `packages/core/src/runtime.ts`
 - `packages/core/src/approvals.ts`
@@ -326,6 +335,7 @@ Responsibilities:
 - tool schemas
 - approval levels
 - workspace file operations
+- exact text replacement
 - patch application
 - shell execution
 - diff inspection
@@ -354,6 +364,7 @@ Current behavior:
 
 - retrieve indexed context first
 - generate a structured round plan with acceptance checks
+- trim and compress context before each execution step
 - execute tool calls iteratively
 - require approval for write and shell tools
 - collect evidence for each round
@@ -367,6 +378,7 @@ Important tooling currently includes:
 - `search_code`
 - `read_multiple_files`
 - `search_index`
+- `replace_exact_text`
 - `write_patch`
 - `apply_unified_patch`
 - `run_shell`
@@ -375,6 +387,15 @@ Important tooling currently includes:
 - `inspect_table`
 - `assert_table_checks`
 - `read_diff`
+
+Editing behavior:
+
+- `replace_exact_text` is the default narrow edit primitive
+- it replaces all exact matches in one file
+- it fails on zero matches
+- it can assert `expected_occurrences`
+- it supports `dry_run` preview mode
+- `apply_unified_patch` remains the fallback for structured changes
 
 `apply_unified_patch` supports:
 
@@ -398,6 +419,7 @@ Current capabilities:
 - submit asynchronous tasks
 - create a persistent chat session
 - send follow-up chat messages
+- subscribe to a per-session SSE event stream
 - inspect plans, finals, verification output, and events
 - preview diffs
 - inspect artifacts
@@ -481,8 +503,11 @@ Included:
 
 - local indexing
 - verifier-driven plan/execute/verify loop
+- single-session context budgeting and rolling summaries
 - tool calling
+- exact text replacement
 - approvals
+- CLI and Web streaming output
 - session persistence
 - CLI
 - minimal web console

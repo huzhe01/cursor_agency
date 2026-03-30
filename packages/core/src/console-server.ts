@@ -5,6 +5,7 @@ import type { AgencyConfig } from './config.js';
 import { readSessionDetail, listSessions } from './session-store.js';
 import { AgencyRuntime, type ConversationHandle } from './runtime.js';
 import { ApprovalManager } from './approvals.js';
+import { RuntimeEventBus, type RuntimeEvent } from './events.js';
 
 interface TaskRecord {
   sessionId: string;
@@ -13,13 +14,31 @@ interface TaskRecord {
   error?: string;
 }
 
+function resolveDisplayStatus(task: TaskRecord | undefined, persistedStatus: string): string {
+  if (!task) {
+    return persistedStatus;
+  }
+  if (task.status === 'running' || task.status === 'failed') {
+    return task.status;
+  }
+  return persistedStatus;
+}
+
 function sendJson(response: http.ServerResponse, status: number, payload: unknown): void {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  response.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store, no-cache, must-revalidate',
+    pragma: 'no-cache',
+  });
   response.end(JSON.stringify(payload));
 }
 
 function sendHtml(response: http.ServerResponse, html: string): void {
-  response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+  response.writeHead(200, {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'no-store, no-cache, must-revalidate',
+    pragma: 'no-cache',
+  });
   response.end(html);
 }
 
@@ -72,7 +91,8 @@ function uiHtml(): string {
       .badge { display:inline-block; border:1px solid var(--line); padding:2px 8px; color:var(--muted); }
       .badge.running { color:var(--accent); }
       .badge.completed { color:var(--good); }
-      .badge.failed { color:var(--bad); }
+      .badge.failed, .badge.FAIL, .badge.BLOCKED { color:var(--bad); }
+      .badge.PASS { color:var(--good); }
       .toolbar { display:flex; gap:8px; margin-top:12px; }
       @media (max-width: 900px) { .shell { grid-template-columns: 1fr; } .sidebar { border-right:0; border-bottom:1px solid var(--line);} .columns { grid-template-columns:1fr; } }
     </style>
@@ -123,6 +143,8 @@ function uiHtml(): string {
           </div>
           <div class="row" style="margin-top:12px;">
             <span class="badge" id="detail-status">unknown</span>
+            <span class="badge" id="detail-phase">phase: idle</span>
+            <span class="badge" id="detail-backend">backend: local</span>
           </div>
         </div>
         <div class="columns">
@@ -151,7 +173,7 @@ function uiHtml(): string {
             <div class="mono" id="artifacts"></div>
           </div>
           <div class="card">
-            <h3>Verifier</h3>
+            <h3>Verifier / Context</h3>
             <div class="mono" id="verifier"></div>
           </div>
         </div>
@@ -164,26 +186,104 @@ function uiHtml(): string {
     <script>
       let selectedSessionId = null;
       let activeChatSessionId = null;
+      let streamSource = null;
+      let detailReloadTimer = null;
 
       async function api(url, options) {
         const response = await fetch(url, options);
-        return response.json();
+        const contentType = response.headers.get('content-type') || '';
+        const payload = contentType.includes('application/json')
+          ? await response.json()
+          : await response.text();
+        if (!response.ok) {
+          const message = typeof payload === 'object' && payload && 'error' in payload
+            ? payload.error
+            : String(payload || response.statusText || 'Request failed');
+          throw new Error(message);
+        }
+        return payload;
+      }
+
+      function setStatus(nodeId, message) {
+        document.getElementById(nodeId).textContent = message || '';
+      }
+
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch]));
       }
 
       function approvalPreview(approval) {
         if (approval.toolName === 'apply_unified_patch') {
           if (Array.isArray(approval.args.patches)) {
-            return approval.args.patches.map((entry) => '# ' + entry.path + '\n' + entry.patch).join('\n\n');
+            return approval.args.patches.map((entry) => '# ' + entry.path + '\\n' + entry.patch).join('\\n\\n');
           }
           return approval.args.patch || '';
         }
-        if (approval.toolName === 'write_patch') {
+        if (approval.toolName === 'replace_exact_text' || approval.toolName === 'write_patch') {
           return JSON.stringify(approval.args, null, 2);
         }
-        if (approval.toolName === 'run_shell') {
-          return '$ ' + (approval.args.command || '');
+        if (approval.toolName === 'run_shell' || approval.toolName === 'run_python_script') {
+          return '$ ' + (approval.args.command || approval.args.script_path || 'structured execution');
         }
         return JSON.stringify(approval.args, null, 2);
+      }
+
+      function scheduleDetailReload() {
+        if (!selectedSessionId) return;
+        clearTimeout(detailReloadTimer);
+        detailReloadTimer = setTimeout(() => {
+          loadDetail(selectedSessionId);
+        }, 120);
+      }
+
+      function connectStream(sessionId) {
+        if (streamSource) {
+          streamSource.close();
+          streamSource = null;
+        }
+        if (!sessionId) {
+          return;
+        }
+        streamSource = new EventSource('/api/sessions/' + encodeURIComponent(sessionId) + '/stream');
+        streamSource.onmessage = (message) => {
+          const event = JSON.parse(message.data);
+          handleStreamEvent(event);
+        };
+        streamSource.onerror = () => {
+          document.getElementById('task-status').textContent = 'Stream disconnected; fallback refresh is still active.';
+        };
+      }
+
+      function handleStreamEvent(event) {
+        if (event.sessionId !== selectedSessionId) {
+          return;
+        }
+        const statusNode = document.getElementById('detail-status');
+        const phaseNode = document.getElementById('detail-phase');
+        const backendNode = document.getElementById('detail-backend');
+        const finalNode = document.getElementById('final');
+        const eventsNode = document.getElementById('events');
+        if (event.backend) {
+          backendNode.textContent = 'backend: ' + event.backend;
+        }
+        if (event.phase) {
+          phaseNode.textContent = 'phase: ' + event.phase;
+        }
+        if (event.type === 'model_text_delta') {
+          finalNode.textContent += event.data?.delta || '';
+        }
+        if (event.type === 'verifier_result' && event.data?.verifierResult?.status) {
+          statusNode.textContent = event.data.verifierResult.status;
+          statusNode.className = 'badge ' + event.data.verifierResult.status;
+        }
+        if (event.type === 'final_result') {
+          statusNode.textContent = event.data?.status || 'completed';
+          statusNode.className = 'badge ' + (event.data?.status || 'completed');
+        }
+        eventsNode.textContent = JSON.stringify(event, null, 2) + '\\n\\n' + eventsNode.textContent;
+        if (event.type !== 'model_text_delta') {
+          scheduleDetailReload();
+        }
       }
 
       async function loadApprovals() {
@@ -192,13 +292,13 @@ function uiHtml(): string {
         container.innerHTML = approvals.length === 0
           ? '<p>No pending approvals.</p>'
           : approvals.map((approval) =>
-              '<div class=\"approval\" data-id=\"' + approval.id + '\">'
+              '<div class="approval" data-id="' + approval.id + '">'
               + '<strong>' + approval.toolName + '</strong>'
               + '<div>' + approval.sessionId + '</div>'
-              + '<div class=\"mono\">' + approvalPreview(approval).replace(/[&<>]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[ch])) + '</div>'
-              + '<div class=\"toolbar\">'
-              + '<button class=\"approve\" data-action=\"approve\" data-id=\"' + approval.id + '\">Approve</button>'
-              + '<button class=\"deny\" data-action=\"deny\" data-id=\"' + approval.id + '\">Deny</button>'
+              + '<div class="mono">' + escapeHtml(approvalPreview(approval)) + '</div>'
+              + '<div class="toolbar">'
+              + '<button class="approve" data-action="approve" data-id="' + approval.id + '">Approve</button>'
+              + '<button class="deny" data-action="deny" data-id="' + approval.id + '">Deny</button>'
               + '</div>'
               + '</div>'
             ).join('');
@@ -219,10 +319,10 @@ function uiHtml(): string {
         const sessions = await api('/api/sessions');
         const container = document.getElementById('sessions');
         container.innerHTML = sessions.map((session) =>
-          '<div class=\"session\" data-id=\"' + session.id + '\">'
-          + '<strong>' + (session.prompt || '(empty prompt)') + '</strong>'
+          '<div class="session" data-id="' + session.id + '">'
+          + '<strong>' + escapeHtml(session.prompt || '(empty prompt)') + '</strong>'
           + '<div>' + session.id + '</div>'
-          + '<div>' + session.mode + '</div>'
+          + '<div>' + session.mode + ' | ' + (session.taskStatus || session.status) + '</div>'
           + '</div>'
         ).join('');
         for (const node of container.querySelectorAll('.session')) {
@@ -237,69 +337,105 @@ function uiHtml(): string {
       async function loadDetail(id) {
         const detail = await api('/api/sessions/' + encodeURIComponent(id));
         selectedSessionId = detail.id;
+        connectStream(detail.id);
         document.getElementById('detail-title').textContent = detail.prompt || '(empty prompt)';
-        document.getElementById('detail-meta').textContent = detail.id + ' | rounds=' + (detail.rounds || 0) + ' | backend=' + (detail.backend || 'local');
+        document.getElementById('detail-meta').textContent = detail.id + ' | rounds=' + (detail.rounds || 0);
         document.getElementById('detail-mode').textContent = detail.mode;
-        document.getElementById('detail-status').textContent = detail.status || detail.taskStatus || 'unknown';
-        document.getElementById('detail-status').className = 'badge ' + (detail.status || detail.taskStatus || '');
+        const displayStatus = detail.displayStatus || detail.status || 'unknown';
+        document.getElementById('detail-status').textContent = displayStatus;
+        document.getElementById('detail-status').className = 'badge ' + displayStatus;
+        document.getElementById('detail-phase').textContent = 'phase: ' + (detail.phase || 'idle');
+        document.getElementById('detail-backend').textContent = 'backend: ' + (detail.backend || 'local');
         document.getElementById('plan').textContent = detail.plan || '';
         document.getElementById('final').textContent = detail.finalMessage || '';
         document.getElementById('verification').textContent = detail.verification || '';
         document.getElementById('diff').textContent = detail.diff || '';
-        document.getElementById('artifacts').textContent = (detail.artifacts || []).join('\n');
+        document.getElementById('artifacts').textContent = (detail.artifacts || []).join('\\n');
         document.getElementById('verifier').textContent = JSON.stringify({
           verifierResult: detail.verifierResult || null,
           acceptanceChecks: detail.acceptanceChecks || [],
           evidenceArtifacts: detail.evidenceArtifacts || [],
+          contextSummaryArtifact: detail.contextSummaryArtifact || null,
+          contextBudgetSnapshot: detail.contextBudgetSnapshot || null,
+          streamArtifacts: detail.streamArtifacts || [],
         }, null, 2);
-        document.getElementById('events').textContent = (detail.events || []).map((event) => JSON.stringify(event, null, 2)).join('\n\n');
+        document.getElementById('events').textContent = (detail.events || []).map((event) => JSON.stringify(event, null, 2)).join('\\n\\n');
       }
 
       async function refreshAll() {
-        await Promise.all([loadApprovals(), loadSessions(selectedSessionId)]);
+        try {
+          await Promise.all([loadApprovals(), loadSessions(selectedSessionId)]);
+        } catch (error) {
+          setStatus('task-status', error instanceof Error ? error.message : String(error));
+        }
       }
 
       document.getElementById('refresh-all').addEventListener('click', refreshAll);
       document.getElementById('run-task').addEventListener('click', async () => {
         const prompt = document.getElementById('task-prompt').value.trim();
-        if (!prompt) return;
-        document.getElementById('task-status').textContent = 'Running...';
-        const result = await api('/api/task', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ prompt }),
-        });
-        document.getElementById('task-status').textContent = result.error ? result.error : 'Task started';
-        await refreshAll();
-        if (result.sessionId) {
-          await loadDetail(result.sessionId);
+        if (!prompt) {
+          setStatus('task-status', 'Enter a task prompt first.');
+          return;
+        }
+        setStatus('task-status', 'Running...');
+        try {
+          const result = await api('/api/task', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+          });
+          setStatus('task-status', 'Task started');
+          await refreshAll();
+          if (result.sessionId) {
+            await loadDetail(result.sessionId);
+          }
+        } catch (error) {
+          setStatus('task-status', error instanceof Error ? error.message : String(error));
         }
       });
 
       document.getElementById('start-chat').addEventListener('click', async () => {
-        const result = await api('/api/chat/start', { method: 'POST' });
-        activeChatSessionId = result.sessionId;
-        document.getElementById('chat-id').textContent = result.sessionId || 'idle';
-        document.getElementById('chat-status').textContent = result.error ? result.error : 'Chat session ready';
-        await refreshAll();
+        try {
+          const result = await api('/api/chat/start', { method: 'POST' });
+          activeChatSessionId = result.sessionId;
+          document.getElementById('chat-id').textContent = result.sessionId || 'idle';
+          setStatus('chat-status', 'Chat session ready');
+          await refreshAll();
+          if (result.sessionId) {
+            await loadDetail(result.sessionId);
+          }
+        } catch (error) {
+          setStatus('chat-status', error instanceof Error ? error.message : String(error));
+        }
       });
 
       document.getElementById('send-chat').addEventListener('click', async () => {
         const prompt = document.getElementById('chat-prompt').value.trim();
-        if (!prompt || !activeChatSessionId) return;
-        document.getElementById('chat-status').textContent = 'Sending...';
-        const result = await api('/api/chat/' + encodeURIComponent(activeChatSessionId), {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ prompt }),
-        });
-        document.getElementById('chat-status').textContent = result.error ? result.error : 'Message sent';
-        document.getElementById('chat-prompt').value = '';
-        await refreshAll();
-        await loadDetail(activeChatSessionId);
+        if (!activeChatSessionId) {
+          setStatus('chat-status', 'Start a chat session first.');
+          return;
+        }
+        if (!prompt) {
+          setStatus('chat-status', 'Enter a message first.');
+          return;
+        }
+        setStatus('chat-status', 'Sending...');
+        try {
+          await api('/api/chat/' + encodeURIComponent(activeChatSessionId), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ prompt }),
+          });
+          setStatus('chat-status', 'Message sent');
+          document.getElementById('chat-prompt').value = '';
+          await refreshAll();
+          await loadDetail(activeChatSessionId);
+        } catch (error) {
+          setStatus('chat-status', error instanceof Error ? error.message : String(error));
+        }
       });
 
-      setInterval(refreshAll, 2500);
+      setInterval(refreshAll, 10000);
       refreshAll();
     </script>
   </body>
@@ -308,7 +444,20 @@ function uiHtml(): string {
 
 export async function startConsoleServer(_runtime: AgencyRuntime, config: AgencyConfig, port = 3000): Promise<http.Server> {
   const approvalManager = new ApprovalManager();
-  const approvalRuntime = new AgencyRuntime(config, approvalManager.createHandler());
+  const eventBus = new RuntimeEventBus();
+  const approvalRuntime = new AgencyRuntime(config, approvalManager.createHandler(), {
+    onEvent: async (event) => {
+      await eventBus.emit({
+        sessionId: event.sessionId,
+        mode: event.mode,
+        type: event.type,
+        phase: event.phase,
+        round: event.round,
+        backend: event.backend,
+        data: event.data,
+      });
+    },
+  });
   const tasks = new Map<string, TaskRecord>();
   const chats = new Map<string, ConversationHandle>();
 
@@ -340,7 +489,32 @@ export async function startConsoleServer(_runtime: AgencyRuntime, config: Agency
         sendJson(response, 200, sessions.map((session) => ({
           ...session,
           taskStatus: tasks.get(session.id)?.status ?? session.status,
+          displayStatus: resolveDisplayStatus(tasks.get(session.id), session.status),
         })));
+        return;
+      }
+
+      if (request.method === 'GET' && url.pathname.startsWith('/api/sessions/') && url.pathname.endsWith('/stream')) {
+        const sessionId = decodeURIComponent(url.pathname.replace('/api/sessions/', '').replace('/stream', ''));
+        const lastEventId = request.headers['last-event-id'];
+        response.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache, no-transform',
+          connection: 'keep-alive',
+        });
+        response.write(': connected\n\n');
+        const unsubscribe = eventBus.subscribe(sessionId, (event: RuntimeEvent) => {
+          response.write(`id: ${event.id}\n`);
+          response.write(`data: ${JSON.stringify(event)}\n\n`);
+        }, typeof lastEventId === 'string' ? lastEventId : Array.isArray(lastEventId) ? lastEventId[0] : null);
+        const heartbeat = setInterval(() => {
+          response.write(': ping\n\n');
+        }, 15000);
+        request.on('close', () => {
+          clearInterval(heartbeat);
+          unsubscribe();
+          response.end();
+        });
         return;
       }
 
@@ -351,6 +525,7 @@ export async function startConsoleServer(_runtime: AgencyRuntime, config: Agency
           ...detail,
           pendingApprovals: approvalManager.list(sessionId),
           taskStatus: tasks.get(sessionId)?.status ?? detail.status,
+          displayStatus: resolveDisplayStatus(tasks.get(sessionId), detail.status),
           taskError: tasks.get(sessionId)?.error,
         } : { error: 'Session not found' });
         return;

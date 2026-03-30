@@ -5,6 +5,7 @@ import path from 'node:path';
 import readline from 'node:readline/promises';
 import process from 'node:process';
 import { AgencyRuntime, ensureWorkspaceDirs, loadConfig, renderDoctorReport, startConsoleServer, type ApprovalRequest } from '@agency/core';
+import type { RuntimeEvent } from '@agency/core';
 
 const rootDir = process.cwd();
 const envPath = path.join(rootDir, '.env.local');
@@ -31,17 +32,70 @@ async function approvalPrompt(request: ApprovalRequest): Promise<boolean> {
 function createRuntime() {
   const config = loadConfig(rootDir);
   ensureWorkspaceDirs(config);
+  let streamingAssistant = false;
+
+  const flushAssistant = () => {
+    if (streamingAssistant) {
+      process.stdout.write('\n');
+      streamingAssistant = false;
+    }
+  };
+
   return {
     config,
     runtime: new AgencyRuntime(config, approvalPrompt, {
-      async onPlan(plan, planPath) {
-        console.log(`\n[plan] ${planPath}\n${plan}\n`);
-      },
-      async onInfo(message) {
-        console.log(`[info] ${message}`);
-      },
-      async onFinal(message) {
-        console.log(`\n[final]\n${message}\n`);
+      async onEvent(event: RuntimeEvent) {
+        if (event.type === 'model_text_delta') {
+          if (!streamingAssistant) {
+            process.stdout.write('\n[assistant]\n');
+            streamingAssistant = true;
+          }
+          process.stdout.write(String(event.data?.delta ?? ''));
+          return;
+        }
+
+        flushAssistant();
+        if (event.type === 'round_started') {
+          console.log(`\n[round ${event.round}]`);
+          return;
+        }
+        if (event.type === 'phase_started') {
+          console.log(`[phase] ${event.phase}${event.backend ? ` | backend=${event.backend}` : ''}`);
+          return;
+        }
+        if (event.type === 'tool_call_started') {
+          console.log(`[tool:start] ${String(event.data?.tool ?? 'unknown')}`);
+          return;
+        }
+        if (event.type === 'tool_call_completed') {
+          const metadata = typeof event.data?.metadata === 'object' && event.data?.metadata ? JSON.stringify(event.data.metadata) : '';
+          console.log(`[tool:done] ${String(event.data?.tool ?? 'unknown')}${metadata ? ` ${metadata}` : ''}`);
+          return;
+        }
+        if (event.type === 'tool_call_failed') {
+          console.log(`[tool:error] ${String(event.data?.tool ?? 'unknown')} ${String(event.data?.error ?? '')}`.trim());
+          return;
+        }
+        if (event.type === 'approval_pending') {
+          console.log(`[approval] ${String(event.data?.toolName ?? 'unknown')} (${String(event.data?.approval ?? 'unknown')})`);
+          return;
+        }
+        if (event.type === 'approval_resolved') {
+          console.log(`[approval:${event.data?.decision ? 'approved' : 'denied'}] ${String(event.data?.toolName ?? 'unknown')}`);
+          return;
+        }
+        if (event.type === 'verifier_result') {
+          const status = String((event.data?.verifierResult as { status?: string } | undefined)?.status ?? 'unknown');
+          console.log(`[verifier] ${status}`);
+          return;
+        }
+        if (event.type === 'final_result') {
+          console.log(`[result] ${String(event.data?.status ?? 'unknown')} | rounds=${String(event.data?.rounds ?? '?')} | backend=${String(event.data?.backend ?? 'local')}`);
+          return;
+        }
+        if (event.type === 'error') {
+          console.log(`[error] ${String(event.data?.message ?? 'unknown error')}`);
+        }
       },
     }),
   };

@@ -9,6 +9,10 @@ export interface AgencyConfig {
   indexPath: string;
   maxToolStepsPerRound: number;
   maxExecutionRounds: number;
+  contextTokenBudget: number;
+  contextReserveTokens: number;
+  toolOutputCharLimit: number;
+  summaryTriggerRatio: number;
   autoApprove: boolean;
   openaiApiKey?: string;
   openaiModel: string;
@@ -48,6 +52,10 @@ export function loadConfig(rootDir = process.cwd()): AgencyConfig {
     indexPath,
     maxToolStepsPerRound: Number(process.env.AGENCY_MAX_TOOL_STEPS ?? 10),
     maxExecutionRounds: Number(process.env.AGENCY_MAX_EXECUTION_ROUNDS ?? 3),
+    contextTokenBudget: Number(process.env.AGENCY_CONTEXT_TOKEN_BUDGET ?? 12000),
+    contextReserveTokens: Number(process.env.AGENCY_CONTEXT_RESERVE_TOKENS ?? 2500),
+    toolOutputCharLimit: Number(process.env.AGENCY_TOOL_OUTPUT_CHAR_LIMIT ?? 3500),
+    summaryTriggerRatio: Number(process.env.AGENCY_SUMMARY_TRIGGER_RATIO ?? 0.8),
     autoApprove: process.env.AGENCY_AUTO_APPROVE === 'true',
     openaiApiKey,
     openaiModel,

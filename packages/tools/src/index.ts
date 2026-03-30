@@ -110,6 +110,7 @@ export interface ToolContext {
   session: SessionLike;
   index: SearchIndexLike;
   backend: ExecutionBackend;
+  toolOutputCharLimit: number;
 }
 
 export interface ToolDefinition {
@@ -130,14 +131,15 @@ function resolvePath(rootDir: string, target: string): string {
   return absolutePath;
 }
 
-async function maybeArtifact(session: SessionLike, label: string, content: string): Promise<ToolExecutionResult> {
-  if (content.length <= 4000) {
+async function maybeArtifact(session: SessionLike, label: string, content: string, maxChars: number): Promise<ToolExecutionResult> {
+  if (content.length <= maxChars) {
     return { content };
   }
 
   const artifactPath = await session.writeArtifact(label, content);
+  const previewChars = Math.min(1200, Math.max(400, Math.floor(maxChars * 0.35)));
   return {
-    content: `${content.slice(0, 1200)}\n\n[truncated] Full output stored at ${artifactPath}`,
+    content: `${content.slice(0, previewChars)}\n\n[truncated] Full output stored at ${artifactPath}`,
     artifactPath,
   };
 }
@@ -151,6 +153,16 @@ function asString(value: unknown, fieldName: string): string {
     throw new Error(`Expected ${fieldName} to be a non-empty string.`);
   }
 
+  return value;
+}
+
+function asPositiveInteger(value: unknown, fieldName: string, fallback: number): number {
+  if (value == null) {
+    return fallback;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Expected ${fieldName} to be a positive integer.`);
+  }
   return value;
 }
 
@@ -186,6 +198,38 @@ async function runCommand(command: string, cwd: string): Promise<{ stdout: strin
   });
 }
 
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) {
+    return 0;
+  }
+
+  let count = 0;
+  let offset = 0;
+  while (true) {
+    const index = haystack.indexOf(needle, offset);
+    if (index === -1) {
+      return count;
+    }
+    count += 1;
+    offset = index + needle.length;
+  }
+}
+
+function formatPagedText(relativePath: string, content: string, startLine: number, maxLines: number): string {
+  const lines = content.split('\n');
+  const startIndex = Math.max(0, startLine - 1);
+  const endIndex = Math.min(lines.length, startIndex + maxLines);
+  const slice = lines.slice(startIndex, endIndex);
+  const body = slice
+    .map((line, index) => `${String(startIndex + index + 1).padStart(4, ' ')} | ${line}`)
+    .join('\n');
+  const header = `# ${relativePath} (lines ${startIndex + 1}-${Math.max(startIndex + 1, endIndex)} of ${lines.length})`;
+  const continuation = endIndex < lines.length
+    ? `\n\n[truncated] Continue with start_line=${endIndex + 1} max_lines=${maxLines}`
+    : '';
+  return `${header}\n${body}${continuation}`;
+}
+
 export function createDefaultTools(): ToolDefinition[] {
   return [
     {
@@ -196,6 +240,8 @@ export function createDefaultTools(): ToolDefinition[] {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Path relative to the repository root.' },
+          start_line: { type: 'integer', minimum: 1, description: '1-based starting line number.' },
+          max_lines: { type: 'integer', minimum: 1, maximum: 400, description: 'Maximum number of lines to read.' },
         },
         required: ['path'],
         additionalProperties: false,
@@ -203,7 +249,10 @@ export function createDefaultTools(): ToolDefinition[] {
       async execute(args, context) {
         const target = resolvePath(context.rootDir, asString(args.path, 'path'));
         const content = await fs.readFile(target, 'utf8');
-        return maybeArtifact(context.session, `read-${path.basename(target)}.txt`, content);
+        const startLine = asPositiveInteger(args.start_line, 'start_line', 1);
+        const maxLines = asPositiveInteger(args.max_lines, 'max_lines', 200);
+        const paged = formatPagedText(path.relative(context.rootDir, target), content, startLine, maxLines);
+        return maybeArtifact(context.session, `read-${path.basename(target)}.txt`, paged, context.toolOutputCharLimit);
       },
     },
     {
@@ -224,7 +273,7 @@ export function createDefaultTools(): ToolDefinition[] {
           context.rootDir,
         );
         const output = [`exit=${exitCode ?? 'null'}`, stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
-        return maybeArtifact(context.session, 'list-files.txt', output);
+        return maybeArtifact(context.session, 'list-files.txt', output, context.toolOutputCharLimit);
       },
     },
     {
@@ -246,7 +295,7 @@ export function createDefaultTools(): ToolDefinition[] {
           context.rootDir,
         );
         const output = [`exit=${exitCode ?? 'null'}`, stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
-        return maybeArtifact(context.session, 'search-code.txt', output);
+        return maybeArtifact(context.session, 'search-code.txt', output, context.toolOutputCharLimit);
       },
     },
     {
@@ -262,6 +311,8 @@ export function createDefaultTools(): ToolDefinition[] {
             minItems: 1,
             maxItems: 8,
           },
+          start_line: { type: 'integer', minimum: 1, description: '1-based starting line number applied to each file.' },
+          max_lines: { type: 'integer', minimum: 1, maximum: 300, description: 'Maximum number of lines to read per file.' },
         },
         required: ['paths'],
         additionalProperties: false,
@@ -270,13 +321,15 @@ export function createDefaultTools(): ToolDefinition[] {
         if (!Array.isArray(args.paths) || args.paths.length === 0) {
           throw new Error('Expected paths to be a non-empty array.');
         }
+        const startLine = asPositiveInteger(args.start_line, 'start_line', 1);
+        const maxLines = asPositiveInteger(args.max_lines, 'max_lines', 160);
         const sections: string[] = [];
         for (const candidate of args.paths) {
           const target = resolvePath(context.rootDir, asString(candidate, 'paths[]'));
           const content = await fs.readFile(target, 'utf8');
-          sections.push(`# ${path.relative(context.rootDir, target)}\n${content}`);
+          sections.push(formatPagedText(path.relative(context.rootDir, target), content, startLine, maxLines));
         }
-        return maybeArtifact(context.session, 'read-multiple-files.txt', sections.join('\n\n'));
+        return maybeArtifact(context.session, 'read-multiple-files.txt', sections.join('\n\n'), context.toolOutputCharLimit);
       },
     },
     {
@@ -301,7 +354,66 @@ export function createDefaultTools(): ToolDefinition[] {
           : results
               .map((result, index) => `${index + 1}. ${result.path}:${result.startLine}-${result.endLine} [${result.source}] score=${result.score.toFixed(3)}\n${result.excerpt}`)
               .join('\n\n');
-        return maybeArtifact(context.session, 'search-index.txt', content);
+        return maybeArtifact(context.session, 'search-index.txt', content, context.toolOutputCharLimit);
+      },
+    },
+    {
+      name: 'replace_exact_text',
+      description: 'Replace every exact text occurrence in a single file. Fails when there are zero matches or the match count differs from expected_occurrences.',
+      approval: 'write',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Path relative to the repository root.' },
+          old_text: { type: 'string', description: 'Exact text to replace.' },
+          new_text: { type: 'string', description: 'Replacement text.' },
+          expected_occurrences: { type: 'integer', minimum: 1, description: 'Optional exact number of expected matches.' },
+          dry_run: { type: 'boolean', description: 'Preview the replacement without writing the file.' },
+        },
+        required: ['path', 'old_text', 'new_text'],
+        additionalProperties: false,
+      },
+      async execute(args, context) {
+        const relativePath = asString(args.path, 'path');
+        const oldText = asString(args.old_text, 'old_text');
+        const newText = typeof args.new_text === 'string' ? args.new_text : '';
+        const expectedOccurrences = typeof args.expected_occurrences === 'number' ? args.expected_occurrences : undefined;
+        const dryRun = args.dry_run === true;
+        const target = resolvePath(context.rootDir, relativePath);
+        const current = await fs.readFile(target, 'utf8');
+        const matchCount = countOccurrences(current, oldText);
+        if (matchCount === 0) {
+          throw new Error(`Exact text was not found in ${relativePath}.`);
+        }
+        if (expectedOccurrences != null && expectedOccurrences !== matchCount) {
+          throw new Error(`Expected ${expectedOccurrences} matches in ${relativePath}, found ${matchCount}.`);
+        }
+
+        const next = current.split(oldText).join(newText);
+        const changed = next !== current;
+        const replacedCount = changed ? matchCount : 0;
+        const patch = createTwoFilesPatch(relativePath, relativePath, current, next, 'before', dryRun ? 'preview' : 'after');
+        const artifact = await context.session.writeArtifact(
+          dryRun ? 'replace-exact-preview.patch' : 'replace-exact.patch',
+          patch,
+        );
+
+        if (!dryRun && changed) {
+          await context.session.captureOriginal(target);
+          await fs.writeFile(target, next, 'utf8');
+        }
+
+        return {
+          content: `${dryRun ? 'Previewed' : 'Applied'} exact text replacement for ${relativePath}. matches=${matchCount} replaced=${replacedCount} changed=${changed}. Preview: ${artifact}`,
+          artifactPath: artifact,
+          metadata: {
+            path: relativePath,
+            matchCount,
+            replacedCount,
+            changed,
+            dryRun,
+          },
+        };
       },
     },
     {
@@ -455,7 +567,7 @@ export function createDefaultTools(): ToolDefinition[] {
         const output = [`$ ${command}`, `exit=${result.exitCode ?? 'null'}`, result.stdout.trim(), result.stderr.trim()]
           .filter(Boolean)
           .join('\n');
-        const artifact = await maybeArtifact(context.session, 'shell-output.txt', output);
+        const artifact = await maybeArtifact(context.session, 'shell-output.txt', output, context.toolOutputCharLimit);
         return {
           ...artifact,
           metadata: {
@@ -500,7 +612,7 @@ export function createDefaultTools(): ToolDefinition[] {
           result.stdout.trim(),
           result.stderr.trim(),
         ].filter(Boolean).join('\n');
-        const artifact = await maybeArtifact(context.session, 'python-output.txt', output);
+        const artifact = await maybeArtifact(context.session, 'python-output.txt', output, context.toolOutputCharLimit);
         return {
           ...artifact,
           metadata: {
@@ -535,7 +647,7 @@ export function createDefaultTools(): ToolDefinition[] {
           sampleRows: typeof args.sample_rows === 'number' ? args.sample_rows : 10,
         });
         const content = JSON.stringify(result, null, 2);
-        const artifact = await maybeArtifact(context.session, 'duckdb-query.json', content);
+        const artifact = await maybeArtifact(context.session, 'duckdb-query.json', content, context.toolOutputCharLimit);
         return {
           ...artifact,
           metadata: result as unknown as Record<string, unknown>,
@@ -565,7 +677,7 @@ export function createDefaultTools(): ToolDefinition[] {
           cwd: typeof args.cwd === 'string' ? args.cwd : '.',
           sampleRows: typeof args.sample_rows === 'number' ? args.sample_rows : 10,
         });
-        const artifact = await maybeArtifact(context.session, 'duckdb-inspect.json', JSON.stringify(result, null, 2));
+        const artifact = await maybeArtifact(context.session, 'duckdb-inspect.json', JSON.stringify(result, null, 2), context.toolOutputCharLimit);
         return {
           ...artifact,
           metadata: result as unknown as Record<string, unknown>,
@@ -630,7 +742,7 @@ export function createDefaultTools(): ToolDefinition[] {
           cwd: typeof args.cwd === 'string' ? args.cwd : '.',
           checks,
         });
-        const artifact = await maybeArtifact(context.session, 'duckdb-checks.json', JSON.stringify(result, null, 2));
+        const artifact = await maybeArtifact(context.session, 'duckdb-checks.json', JSON.stringify(result, null, 2), context.toolOutputCharLimit);
         return {
           ...artifact,
           metadata: result as unknown as Record<string, unknown>,
@@ -651,7 +763,7 @@ export function createDefaultTools(): ToolDefinition[] {
       async execute(args, context) {
         const target = typeof args.path === 'string' ? resolvePath(context.rootDir, args.path) : undefined;
         const diff = await context.session.renderDiff(target);
-        return maybeArtifact(context.session, 'workspace-diff.patch', diff || 'No changes captured in this session.');
+        return maybeArtifact(context.session, 'workspace-diff.patch', diff || 'No changes captured in this session.', context.toolOutputCharLimit);
       },
     },
   ];

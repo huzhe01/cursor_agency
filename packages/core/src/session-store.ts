@@ -17,6 +17,7 @@ export interface SessionSummary {
   status: string;
   rounds: number;
   backend: string;
+  phase?: string;
   finalMessage: string;
   verification: string;
   planPath: string;
@@ -31,6 +32,9 @@ export interface SessionDetail extends SessionSummary {
   verifierResult?: Record<string, unknown>;
   acceptanceChecks: Array<Record<string, unknown>>;
   evidenceArtifacts: string[];
+  contextSummaryArtifact?: string;
+  contextBudgetSnapshot?: Record<string, unknown>;
+  streamArtifacts: string[];
 }
 
 export class SessionStore {
@@ -142,6 +146,7 @@ async function readJsonLines(filePath: string): Promise<SessionEvent[]> {
 function extractSummary(id: string, sessionDir: string, events: SessionEvent[]): SessionSummary {
   const firstPrompt = events.find((event) => event.type === 'user_prompt')?.payload.prompt;
   const finalEvent = [...events].reverse().find((event: SessionEvent) => event.type === 'final');
+  const phaseEvent = [...events].reverse().find((event) => event.type === 'phase_started' || event.type === 'phase_completed');
   const mode = ((events.find((event) => event.type === 'user_prompt')?.payload.mode
     ?? events.find((event) => event.type === 'session_started')?.payload.mode) as 'task' | 'chat' | undefined) ?? 'task';
   return {
@@ -152,6 +157,7 @@ function extractSummary(id: string, sessionDir: string, events: SessionEvent[]):
     status: typeof finalEvent?.payload.status === 'string' ? finalEvent.payload.status : 'completed',
     rounds: typeof finalEvent?.payload.rounds === 'number' ? finalEvent.payload.rounds : 0,
     backend: typeof finalEvent?.payload.backend === 'string' ? finalEvent.payload.backend : 'local',
+    phase: typeof phaseEvent?.payload.phase === 'string' ? phaseEvent.payload.phase : undefined,
     finalMessage: typeof finalEvent?.payload.finalMessage === 'string' ? finalEvent.payload.finalMessage : '',
     verification: typeof finalEvent?.payload.verification === 'string' ? finalEvent.payload.verification : '',
     planPath: path.join(sessionDir, 'plan.md'),
@@ -192,6 +198,8 @@ export async function readSessionDetail(rootDir: string, sessionRoot: string, se
       ?? [...sortedArtifacts].reverse().find((artifact) => artifact.endsWith('.patch'));
     const diff = diffArtifact ? await fs.readFile(path.join(sessionDir, 'artifacts', diffArtifact), 'utf8').catch(() => '') : '';
     const verifierEvent = [...events].reverse().find((event) => event.type === 'verifier_result');
+    const contextEvent = [...events].reverse().find((event) => event.type === 'context_budget');
+    const finalEvent = [...events].reverse().find((event) => event.type === 'final');
     return {
       ...summary,
       plan,
@@ -201,6 +209,13 @@ export async function readSessionDetail(rootDir: string, sessionRoot: string, se
       verifierResult: verifierEvent?.payload.verifierResult as Record<string, unknown> | undefined,
       acceptanceChecks: Array.isArray(verifierEvent?.payload.acceptanceChecks) ? verifierEvent?.payload.acceptanceChecks as Array<Record<string, unknown>> : [],
       evidenceArtifacts: Array.isArray(verifierEvent?.payload.evidenceArtifacts) ? verifierEvent?.payload.evidenceArtifacts as string[] : [],
+      contextSummaryArtifact: typeof (contextEvent?.payload.snapshot as Record<string, unknown> | undefined)?.summaryArtifactPath === 'string'
+        ? (contextEvent?.payload.snapshot as Record<string, unknown>).summaryArtifactPath as string
+        : undefined,
+      contextBudgetSnapshot: typeof contextEvent?.payload.snapshot === 'object' && contextEvent.payload.snapshot
+        ? contextEvent.payload.snapshot as Record<string, unknown>
+        : undefined,
+      streamArtifacts: Array.isArray(finalEvent?.payload.artifacts) ? finalEvent?.payload.artifacts as string[] : [],
     };
   } catch {
     return null;

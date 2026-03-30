@@ -44,6 +44,23 @@ USAGE
     run_dev pnpm agency "$cmd" "$@"
     ;;
   web)
+    web_port="3000"
+    if [[ $# -gt 0 ]]; then
+      args=("$@")
+      for ((i=0; i<${#args[@]}; i++)); do
+        case "${args[$i]}" in
+          --port)
+            if (( i + 1 < ${#args[@]} )); then
+              web_port="${args[$((i + 1))]}"
+            fi
+            ;;
+          --port=*)
+            web_port="${args[$i]#--port=}"
+            ;;
+        esac
+      done
+    fi
+    export AGENCY_WEB_PORT="$web_port"
     compose run --rm --service-ports dev pnpm agency "$cmd" "$@"
     ;;
   up)

@@ -24,4 +24,4 @@ services:
     volumes:
       - .:/workspace
     ports:
-      - "3000:3000"
+      - "${AGENCY_WEB_PORT:-3000}:${AGENCY_WEB_PORT:-3000}"
