@@ -8,6 +8,7 @@ mkdir -p \
   /workspace/.cache/npm \
   /workspace/.cache/pnpm/home \
   /workspace/.cache/pnpm/store \
+  /workspace/.cache/python \
   /workspace/.cache/uv \
   /workspace/.cache/playwright
 

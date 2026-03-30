@@ -86,6 +86,9 @@ program
     try {
       const outcome = await runtime.runTask(prompt, 'task');
       console.log(`[session] ${outcome.sessionId}`);
+      console.log(`[status] ${outcome.status}`);
+      console.log(`[rounds] ${outcome.rounds}`);
+      console.log(`[backend] ${outcome.backend}`);
       console.log(`\n[verification]\n${outcome.verification}\n`);
       if (outcome.diff) {
         console.log(`[diff]\n${outcome.diff}`);
@@ -126,6 +129,7 @@ program
         }
         const outcome = await chat.prompt(input);
         console.log(`\n[final]\n${outcome.finalMessage}\n`);
+        console.log(`[status] ${outcome.status} | [rounds] ${outcome.rounds} | [backend] ${outcome.backend}`);
         console.log(`\n[verification]\n${outcome.verification}\n`);
       }
     } finally {

@@ -18,6 +18,81 @@ export interface SearchIndexLike {
   search(query: string, limit?: number): Promise<SearchIndexHit[]>;
 }
 
+export interface BackendCommandResult {
+  backend: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  generatedFiles: string[];
+  command?: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PythonScriptRequest {
+  script?: string;
+  scriptPath?: string;
+  args?: string[];
+  cwd?: string;
+  inputPaths?: string[];
+  outputPaths?: string[];
+}
+
+export interface DuckDbSqlRequest {
+  sql: string;
+  databasePath?: string;
+  cwd?: string;
+  sampleRows?: number;
+}
+
+export interface DuckDbSqlResult {
+  backend: string;
+  rowCount: number;
+  columns: string[];
+  rows: Array<Record<string, unknown>>;
+  databasePath?: string;
+  sql: string;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TableCheck {
+  type: 'row_count' | 'columns_exact' | 'no_nulls' | 'value_range' | 'aggregate_equals';
+  column?: string;
+  equals?: number | string | boolean;
+  min?: number;
+  max?: number;
+  expr?: string;
+  columns?: string[];
+}
+
+export interface TableCheckResult {
+  backend: string;
+  passed: boolean;
+  failures: string[];
+  details: Array<Record<string, unknown>>;
+  table: string;
+  databasePath?: string;
+}
+
+export interface TableInspectionResult {
+  backend: string;
+  table: string;
+  rowCount: number;
+  columns: string[];
+  sampleRows: Array<Record<string, unknown>>;
+  databasePath?: string;
+}
+
+export interface ExecutionBackend {
+  readonly name: string;
+  prepare(): Promise<void>;
+  runShell(command: string, options?: { cwd?: string; inputPaths?: string[]; outputPaths?: string[] }): Promise<BackendCommandResult>;
+  runPythonScript(request: PythonScriptRequest): Promise<BackendCommandResult>;
+  runDuckDbSql(request: DuckDbSqlRequest): Promise<DuckDbSqlResult>;
+  inspectTable(request: { table: string; databasePath?: string; cwd?: string; sampleRows?: number }): Promise<TableInspectionResult>;
+  assertTableChecks(request: { table: string; databasePath?: string; cwd?: string; checks: TableCheck[] }): Promise<TableCheckResult>;
+  close?(): Promise<void>;
+}
+
 export interface SessionLike {
   captureOriginal(filePath: string): Promise<void>;
   renderDiff(targetPath?: string): Promise<string>;
@@ -27,12 +102,14 @@ export interface SessionLike {
 export interface ToolExecutionResult {
   content: string;
   artifactPath?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ToolContext {
   rootDir: string;
   session: SessionLike;
   index: SearchIndexLike;
+  backend: ExecutionBackend;
 }
 
 export interface ToolDefinition {
@@ -373,11 +450,191 @@ export function createDefaultTools(): ToolDefinition[] {
       },
       async execute(args, context) {
         const command = asString(args.command, 'command');
-        const result = await runCommand(command, context.rootDir);
+        await context.backend.prepare();
+        const result = await context.backend.runShell(command, { cwd: '.' });
         const output = [`$ ${command}`, `exit=${result.exitCode ?? 'null'}`, result.stdout.trim(), result.stderr.trim()]
           .filter(Boolean)
           .join('\n');
-        return maybeArtifact(context.session, 'shell-output.txt', output);
+        const artifact = await maybeArtifact(context.session, 'shell-output.txt', output);
+        return {
+          ...artifact,
+          metadata: {
+            backend: result.backend,
+            exitCode: result.exitCode,
+            generatedFiles: result.generatedFiles,
+            command,
+          },
+        };
+      },
+    },
+    {
+      name: 'run_python_script',
+      description: 'Run a Python script inside the configured execution backend. Supports inline code or a workspace script path.',
+      approval: 'shell',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          script: { type: 'string', description: 'Inline Python source code.' },
+          script_path: { type: 'string', description: 'Existing Python script path relative to the repository root.' },
+          args: { type: 'array', items: { type: 'string' }, maxItems: 20 },
+          cwd: { type: 'string', description: 'Optional working directory relative to the repository root.' },
+          input_paths: { type: 'array', items: { type: 'string' }, maxItems: 20 },
+          output_paths: { type: 'array', items: { type: 'string' }, maxItems: 20 },
+        },
+        additionalProperties: false,
+      },
+      async execute(args, context) {
+        await context.backend.prepare();
+        const result = await context.backend.runPythonScript({
+          script: typeof args.script === 'string' ? args.script : undefined,
+          scriptPath: typeof args.script_path === 'string' ? args.script_path : undefined,
+          args: Array.isArray(args.args) ? args.args.map((item, index) => asString(item, `args[${index}]`)) : [],
+          cwd: typeof args.cwd === 'string' ? args.cwd : '.',
+          inputPaths: Array.isArray(args.input_paths) ? args.input_paths.map((item, index) => asString(item, `input_paths[${index}]`)) : [],
+          outputPaths: Array.isArray(args.output_paths) ? args.output_paths.map((item, index) => asString(item, `output_paths[${index}]`)) : [],
+        });
+        const output = [
+          `backend=${result.backend}`,
+          `exit=${result.exitCode ?? 'null'}`,
+          result.generatedFiles.length > 0 ? `generated=${result.generatedFiles.join(', ')}` : '',
+          result.stdout.trim(),
+          result.stderr.trim(),
+        ].filter(Boolean).join('\n');
+        const artifact = await maybeArtifact(context.session, 'python-output.txt', output);
+        return {
+          ...artifact,
+          metadata: {
+            backend: result.backend,
+            exitCode: result.exitCode,
+            generatedFiles: result.generatedFiles,
+          },
+        };
+      },
+    },
+    {
+      name: 'run_duckdb_sql',
+      description: 'Run a DuckDB SQL query and return structured rows, schema, and row count.',
+      approval: 'shell',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          sql: { type: 'string', description: 'DuckDB SQL to execute.' },
+          database_path: { type: 'string', description: 'Optional DuckDB database path relative to the repository root. Defaults to :memory:.' },
+          cwd: { type: 'string', description: 'Optional working directory relative to the repository root.' },
+          sample_rows: { type: 'integer', minimum: 1, maximum: 100 },
+        },
+        required: ['sql'],
+        additionalProperties: false,
+      },
+      async execute(args, context) {
+        await context.backend.prepare();
+        const result = await context.backend.runDuckDbSql({
+          sql: asString(args.sql, 'sql'),
+          databasePath: typeof args.database_path === 'string' ? args.database_path : undefined,
+          cwd: typeof args.cwd === 'string' ? args.cwd : '.',
+          sampleRows: typeof args.sample_rows === 'number' ? args.sample_rows : 10,
+        });
+        const content = JSON.stringify(result, null, 2);
+        const artifact = await maybeArtifact(context.session, 'duckdb-query.json', content);
+        return {
+          ...artifact,
+          metadata: result as unknown as Record<string, unknown>,
+        };
+      },
+    },
+    {
+      name: 'inspect_table',
+      description: 'Inspect a DuckDB table and return row count, columns, and sample rows.',
+      approval: 'read',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          table: { type: 'string', description: 'Table or view name.' },
+          database_path: { type: 'string', description: 'Optional DuckDB database path relative to the repository root.' },
+          cwd: { type: 'string', description: 'Optional working directory relative to the repository root.' },
+          sample_rows: { type: 'integer', minimum: 1, maximum: 100 },
+        },
+        required: ['table'],
+        additionalProperties: false,
+      },
+      async execute(args, context) {
+        await context.backend.prepare();
+        const result = await context.backend.inspectTable({
+          table: asString(args.table, 'table'),
+          databasePath: typeof args.database_path === 'string' ? args.database_path : undefined,
+          cwd: typeof args.cwd === 'string' ? args.cwd : '.',
+          sampleRows: typeof args.sample_rows === 'number' ? args.sample_rows : 10,
+        });
+        const artifact = await maybeArtifact(context.session, 'duckdb-inspect.json', JSON.stringify(result, null, 2));
+        return {
+          ...artifact,
+          metadata: result as unknown as Record<string, unknown>,
+        };
+      },
+    },
+    {
+      name: 'assert_table_checks',
+      description: 'Run structured validation checks against a DuckDB table.',
+      approval: 'read',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          table: { type: 'string', description: 'Table or view name.' },
+          database_path: { type: 'string', description: 'Optional DuckDB database path relative to the repository root.' },
+          cwd: { type: 'string', description: 'Optional working directory relative to the repository root.' },
+          checks: {
+            type: 'array',
+            minItems: 1,
+            maxItems: 20,
+            items: {
+              type: 'object',
+              properties: {
+                type: { type: 'string', enum: ['row_count', 'columns_exact', 'no_nulls', 'value_range', 'aggregate_equals'] },
+                column: { type: 'string' },
+                equals: { type: ['number', 'string', 'boolean'] },
+                min: { type: 'number' },
+                max: { type: 'number' },
+                expr: { type: 'string' },
+                columns: { type: 'array', items: { type: 'string' }, maxItems: 100 },
+              },
+              required: ['type'],
+              additionalProperties: false,
+            },
+          },
+        },
+        required: ['table', 'checks'],
+        additionalProperties: false,
+      },
+      async execute(args, context) {
+        if (!Array.isArray(args.checks) || args.checks.length === 0) {
+          throw new Error('Expected checks to be a non-empty array.');
+        }
+        await context.backend.prepare();
+        const checks = args.checks.map((check, index) => {
+          const candidate = check as Record<string, unknown>;
+          return {
+            type: asString(candidate.type, `checks[${index}].type`) as TableCheck['type'],
+            column: typeof candidate.column === 'string' ? candidate.column : undefined,
+            equals: typeof candidate.equals === 'number' || typeof candidate.equals === 'string' || typeof candidate.equals === 'boolean'
+              ? candidate.equals
+              : undefined,
+            min: typeof candidate.min === 'number' ? candidate.min : undefined,
+            max: typeof candidate.max === 'number' ? candidate.max : undefined,
+            expr: typeof candidate.expr === 'string' ? candidate.expr : undefined,
+            columns: Array.isArray(candidate.columns) ? candidate.columns.map((item, innerIndex) => asString(item, `checks[${index}].columns[${innerIndex}]`)) : undefined,
+          } satisfies TableCheck;
+        });
+        const result = await context.backend.assertTableChecks({
+          table: asString(args.table, 'table'),
+          databasePath: typeof args.database_path === 'string' ? args.database_path : undefined,
+          cwd: typeof args.cwd === 'string' ? args.cwd : '.',
+          checks,
+        });
+        const artifact = await maybeArtifact(context.session, 'duckdb-checks.json', JSON.stringify(result, null, 2));
+        return {
+          ...artifact,
+          metadata: result as unknown as Record<string, unknown>,
+        };
       },
     },
     {

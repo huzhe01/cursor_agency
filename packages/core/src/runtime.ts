@@ -4,6 +4,9 @@ import { SessionStore } from './session-store.js';
 import { OpenAIModelAdapter } from './openai.js';
 import { SQLiteIndexProvider, type SearchResult } from '@agency/indexer';
 import { createDefaultTools, type ApprovalKind, type ToolContext, type ToolDefinition } from '@agency/tools';
+import { createBackendFactory } from './execution-backends.js';
+import type { AcceptanceCheck, EvidenceBundle, EvidenceItem, VerifierResult, VerifierStatus } from './verifier.js';
+import { ModelVerifier, RuleVerifier, verifyWithFallback } from './verifier.js';
 
 export interface ApprovalRequest {
   sessionId: string;
@@ -22,10 +25,15 @@ export interface RuntimeCallbacks {
 
 export interface TaskOutcome {
   sessionId: string;
+  status: VerifierStatus;
+  rounds: number;
+  backend: string;
   plan: string;
   finalMessage: string;
   verification: string;
+  verifierResult: VerifierResult;
   diff: string;
+  artifacts: string[];
 }
 
 export interface ConversationHandle {
@@ -39,21 +47,38 @@ interface ConversationState {
   messages: Array<Record<string, unknown>>;
 }
 
-const PLAN_PROMPT = `You are planning a coding task inside a repository. Produce concise Markdown with these headings: Goal, Context, Steps, Verification. Mention likely files. Prefer a short, execution-ready plan.`;
-const EXECUTION_PROMPT = `You are a pragmatic code agent working in a real repository.
+interface RoundPlan {
+  planMarkdown: string;
+  acceptanceChecks: AcceptanceCheck[];
+  requiredEvidence: string[];
+  preferredBackend: 'default' | 'local' | 'e2b';
+}
 
-Follow this loop:
-1. Gather context with list_files, search_index, search_code, read_file, or read_multiple_files.
-2. Decide on one narrow change at a time.
-3. Prefer apply_unified_patch for precise edits. Use write_patch only for simple replacements or full-file creation.
-4. Verify after changes. Always call read_diff before your final answer when files changed.
+interface RoundExecutionResult {
+  finalMessage: string;
+  diff: string;
+  evidence: EvidenceItem[];
+  blockedReasons: string[];
+  failures: string[];
+  artifacts: string[];
+}
 
-Rules:
-- Do not call write tools before inspecting the relevant file contents.
+const EXECUTION_PROMPT = `You are a pragmatic code and data agent working in a real repository.
+
+You must operate in explicit loops:
+1. Gather context.
+2. Execute one narrow round of work.
+3. Produce evidence for the verifier.
+4. Stop when the verifier passes or blocks the task.
+
+Execution rules:
+- Read before editing.
+- Prefer apply_unified_patch for precise edits.
+- Prefer run_python_script, run_duckdb_sql, inspect_table, and assert_table_checks for data work.
 - Keep shell commands bounded and diagnostic.
-- If the task can be answered without changing files, do not edit.
-- If a write or shell tool is denied, continue with read-only analysis.
-- Keep final answers concise and concrete.`;
+- If a write or shell tool is denied, continue with read-only analysis and surface the blocker.
+- When files change, call read_diff before finishing the round.
+- Keep final answers concise and factual.`;
 
 function formatHits(hits: SearchResult[]): string {
   if (hits.length === 0) {
@@ -76,16 +101,61 @@ function toToolSpecs(tools: ToolDefinition[]): Array<Record<string, unknown>> {
   }));
 }
 
-function buildExecutionUserPrompt(prompt: string, plan: string, hits: SearchResult[]): string {
+function defaultAcceptanceChecks(prompt: string): AcceptanceCheck[] {
+  const normalized = prompt.toLowerCase();
+  const checks: AcceptanceCheck[] = [];
+  if (/(fix|update|change|implement|write|create|modify|patch)/.test(normalized)) {
+    checks.push({ type: 'diff_present', description: 'The task should produce a concrete workspace diff.' });
+  } else {
+    checks.push({ type: 'read_only_answer', description: 'The task should end with a concise read-only answer.' });
+  }
+
+  if (/(duckdb|sql|csv|parquet|python|data)/.test(normalized)) {
+    checks.push({ type: 'python_exit_zero', description: 'Python execution must succeed for data-analysis work.' });
+  }
+
+  return checks;
+}
+
+function normalizeRoundPlan(value: Partial<RoundPlan> | undefined, prompt: string): RoundPlan {
+  const normalizedChecks = Array.isArray(value?.acceptanceChecks)
+    ? value.acceptanceChecks.filter((check): check is AcceptanceCheck => Boolean(check?.type && check?.description))
+    : [];
+  return {
+    planMarkdown: typeof value?.planMarkdown === 'string' && value.planMarkdown.trim()
+      ? value.planMarkdown.trim()
+      : `# Goal\n${prompt}\n\n# Steps\n1. Inspect the relevant code or data.\n2. Perform one narrow execution round.\n3. Collect evidence and verify the result.`,
+    acceptanceChecks: normalizedChecks.length > 0 ? normalizedChecks : defaultAcceptanceChecks(prompt),
+    requiredEvidence: Array.isArray(value?.requiredEvidence)
+      ? value.requiredEvidence.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : ['tool outputs', 'final reasoning'],
+    preferredBackend: value?.preferredBackend === 'local' || value?.preferredBackend === 'e2b' ? value.preferredBackend : 'default',
+  };
+}
+
+function buildRoundPlanningPrompt(prompt: string, hits: SearchResult[], previousVerifier?: VerifierResult): string {
   return [
     `Task:\n${prompt}`,
-    `Plan:\n${plan}`,
     `Indexed context:\n${formatHits(hits)}`,
-    'Working style:',
-    '- Inspect before editing.',
-    '- Use apply_unified_patch for exact code changes.',
-    '- Keep edits minimal and local.',
-    '- Verify with read_diff before finishing if any file changed.',
+    previousVerifier
+      ? `Previous verifier result:\n${JSON.stringify(previousVerifier, null, 2)}`
+      : 'Previous verifier result:\nNone',
+    'Return strict JSON with keys planMarkdown, acceptanceChecks, requiredEvidence, preferredBackend.',
+    'acceptanceChecks must use only these types: read_only_answer, diff_present, shell_exit_zero, python_exit_zero, duckdb_checks_pass, artifact_exists.',
+    'preferredBackend must be one of default, local, e2b.',
+  ].join('\n\n');
+}
+
+function buildRoundExecutionPrompt(prompt: string, roundPlan: RoundPlan, hits: SearchResult[], round: number, previousVerifier?: VerifierResult): string {
+  return [
+    `Task:\n${prompt}`,
+    `Round: ${round}`,
+    `Plan:\n${roundPlan.planMarkdown}`,
+    `Acceptance checks:\n${JSON.stringify(roundPlan.acceptanceChecks, null, 2)}`,
+    `Required evidence:\n${roundPlan.requiredEvidence.join(', ')}`,
+    `Indexed context:\n${formatHits(hits)}`,
+    previousVerifier ? `Previous verifier:\n${JSON.stringify(previousVerifier, null, 2)}` : 'Previous verifier:\nNone',
+    'Gather evidence for the verifier. If you modify files, read the diff before you stop this round.',
   ].join('\n\n');
 }
 
@@ -97,23 +167,107 @@ async function maybeApprove(request: ApprovalRequest, approvalHandler: ApprovalH
   return approvalHandler(request);
 }
 
+function buildEvidenceFromTool(
+  toolName: string,
+  metadata: Record<string, unknown> | undefined,
+  artifactPath: string | undefined,
+): EvidenceItem[] {
+  if (!metadata) {
+    return artifactPath ? [{ kind: 'artifact', summary: `${toolName} produced ${artifactPath}`, artifactPath, passed: true }] : [];
+  }
+
+  if (toolName === 'run_shell') {
+    const exitCode = typeof metadata.exitCode === 'number' ? metadata.exitCode : null;
+    return [{
+      kind: exitCode === 0 ? 'shell_success' : 'shell_failure',
+      summary: `Shell command finished with exit=${exitCode ?? 'null'}.`,
+      artifactPath,
+      passed: exitCode === 0,
+      metadata,
+    }];
+  }
+
+  if (toolName === 'run_python_script') {
+    const exitCode = typeof metadata.exitCode === 'number' ? metadata.exitCode : null;
+    return [{
+      kind: exitCode === 0 ? 'python_success' : 'python_failure',
+      summary: `Python script finished with exit=${exitCode ?? 'null'}.`,
+      artifactPath,
+      passed: exitCode === 0,
+      metadata,
+    }];
+  }
+
+  if (toolName === 'assert_table_checks') {
+    const passed = metadata.passed === true;
+    return [{
+      kind: passed ? 'duckdb_checks_pass' : 'duckdb_checks_fail',
+      summary: passed ? 'DuckDB table checks passed.' : `DuckDB table checks failed: ${Array.isArray(metadata.failures) ? metadata.failures.join('; ') : 'unknown failure'}`,
+      artifactPath,
+      passed,
+      metadata,
+    }];
+  }
+
+  if (toolName === 'run_duckdb_sql') {
+    return [{
+      kind: 'duckdb_query',
+      summary: `DuckDB query returned ${String(metadata.rowCount ?? '?')} row(s).`,
+      artifactPath,
+      passed: true,
+      metadata,
+    }];
+  }
+
+  if (toolName === 'inspect_table') {
+    return [{
+      kind: 'duckdb_inspection',
+      summary: `Inspected table ${String(metadata.table ?? '?')} with ${String(metadata.rowCount ?? '?')} row(s).`,
+      artifactPath,
+      passed: true,
+      metadata,
+    }];
+  }
+
+  return artifactPath ? [{ kind: 'artifact', summary: `${toolName} produced ${artifactPath}`, artifactPath, passed: true, metadata }] : [];
+}
+
 export class AgencyRuntime {
   private readonly config: AgencyConfig;
-  private readonly model: OpenAIModelAdapter;
+  private readonly actorModel: OpenAIModelAdapter;
+  private readonly verifierModel: OpenAIModelAdapter;
   private readonly index: SQLiteIndexProvider;
   private readonly approvalHandler: ApprovalHandler;
   private readonly callbacks: RuntimeCallbacks;
+  private readonly backendFactory;
+  private readonly ruleVerifier: RuleVerifier;
+  private readonly modelVerifier: ModelVerifier;
 
   constructor(config: AgencyConfig, approvalHandler: ApprovalHandler, callbacks: RuntimeCallbacks = {}) {
     this.config = config;
-    this.model = new OpenAIModelAdapter(config);
+    this.actorModel = new OpenAIModelAdapter(config);
+    this.verifierModel = new OpenAIModelAdapter(config, {
+      apiKey: config.verifierApiKey,
+      baseUrl: config.verifierBaseUrl,
+      model: config.verifierModel,
+      embedModel: config.openaiEmbedModel,
+    });
     this.index = new SQLiteIndexProvider({
       rootDir: config.rootDir,
       dbPath: config.indexPath,
-      embedder: this.model.ready ? this.model : undefined,
+      embedder: this.actorModel.ready ? this.actorModel : undefined,
     });
     this.approvalHandler = approvalHandler;
     this.callbacks = callbacks;
+    this.backendFactory = createBackendFactory({
+      rootDir: config.rootDir,
+      cacheDir: config.cacheDir,
+      defaultBackend: config.defaultBackend,
+      e2bApiKey: config.e2bApiKey,
+      e2bTemplateId: config.e2bTemplateId,
+    });
+    this.ruleVerifier = new RuleVerifier();
+    this.modelVerifier = new ModelVerifier(this.verifierModel);
   }
 
   async buildIndex(): Promise<ReturnType<SQLiteIndexProvider['build']>> {
@@ -160,114 +314,222 @@ export class AgencyRuntime {
     return this.createConversationState(session, mode);
   }
 
+  private async planRound(prompt: string, hits: SearchResult[], previousVerifier?: VerifierResult): Promise<RoundPlan> {
+    try {
+      return normalizeRoundPlan(
+        await this.actorModel.generateJson<RoundPlan>(
+          'You are planning a single execution round for a coding and data-analysis agent. Return strict JSON only.',
+          buildRoundPlanningPrompt(prompt, hits, previousVerifier),
+          { temperature: 0.1 },
+        ),
+        prompt,
+      );
+    } catch {
+      return normalizeRoundPlan(undefined, prompt);
+    }
+  }
+
   private async runConversationTurn(conversation: ConversationState, prompt: string): Promise<TaskOutcome> {
-    if (!this.model.ready) {
+    if (!this.actorModel.ready) {
       throw new Error('OPENAI_API_KEY is required for task and chat commands.');
     }
 
     const session = conversation.session;
     const hits = await this.index.search(prompt, 6).catch(() => []);
-    const plan = await this.model.generateText(
-      PLAN_PROMPT,
-      `Task:\n${prompt}\n\nIndexed context:\n${formatHits(hits)}`,
-    );
-    await session.writePlan(plan);
     await session.appendEvent('user_prompt', { prompt, mode: conversation.mode });
-    await this.callbacks.onPlan?.(plan, relativeToRoot(this.config, session.planPath));
 
-    const tools = createDefaultTools();
-    const toolContext: ToolContext = {
-      rootDir: this.config.rootDir,
-      session,
-      index: this.index,
+    let previousVerifier: VerifierResult | undefined;
+    let lastBackend = 'local';
+    let lastPlan = '';
+    let lastFinalMessage = '';
+    let lastDiff = '';
+    let lastArtifacts: string[] = [];
+    let roundsUsed = 0;
+    let finalVerifier: VerifierResult = {
+      status: 'FAIL',
+      summary: 'The task did not complete.',
+      evidence: [],
+      missingChecks: [],
+      nextAction: 'Inspect the execution history.',
     };
 
-    conversation.messages.push({
-      role: 'user',
-      content: buildExecutionUserPrompt(prompt, plan, hits),
-    });
-
+    const tools = createDefaultTools();
     const toolSpecs = toToolSpecs(tools);
-    let finalMessage = '';
 
-    for (let step = 0; step < this.config.maxToolSteps; step += 1) {
-      const turn = await this.model.completeWithTools(conversation.messages, toolSpecs);
-      conversation.messages.push(turn.rawMessage);
-      if (turn.text) {
-        await session.appendEvent('assistant_message', { step, content: turn.text });
+    for (let round = 1; round <= this.config.maxExecutionRounds; round += 1) {
+      roundsUsed = round;
+      const roundPlan = await this.planRound(prompt, hits, previousVerifier);
+      lastPlan = roundPlan.planMarkdown;
+      await session.writePlan(roundPlan.planMarkdown);
+      await session.appendEvent('round_started', {
+        round,
+        acceptanceChecks: roundPlan.acceptanceChecks,
+        requiredEvidence: roundPlan.requiredEvidence,
+        preferredBackend: roundPlan.preferredBackend,
+      });
+      await this.callbacks.onPlan?.(roundPlan.planMarkdown, relativeToRoot(this.config, session.planPath));
+
+      const { backend, selectionReason } = await this.backendFactory.select(roundPlan.preferredBackend, `Round ${round} backend selection.`);
+      lastBackend = backend.name;
+      await backend.prepare();
+      await session.appendEvent('execution_backend', { round, backend: backend.name, selectionReason });
+
+      const toolContext: ToolContext = {
+        rootDir: this.config.rootDir,
+        session,
+        index: this.index,
+        backend,
+      };
+
+      conversation.messages.push({
+        role: 'user',
+        content: buildRoundExecutionPrompt(prompt, roundPlan, hits, round, previousVerifier),
+      });
+
+      const roundEvidence: EvidenceItem[] = [];
+      const blockedReasons: string[] = [];
+      const failures: string[] = [];
+      const artifacts: string[] = [];
+      let finalMessage = '';
+
+      for (let step = 0; step < this.config.maxToolStepsPerRound; step += 1) {
+        const turn = await this.actorModel.completeWithTools(conversation.messages, toolSpecs);
+        conversation.messages.push(turn.rawMessage);
+        if (turn.text) {
+          await session.appendEvent('assistant_message', { round, step, content: turn.text });
+        }
+
+        if (turn.toolCalls.length === 0) {
+          finalMessage = turn.text || 'Task completed without additional output.';
+          break;
+        }
+
+        for (const toolCall of turn.toolCalls) {
+          const tool = tools.find((candidate) => candidate.name === toolCall.name);
+          if (!tool) {
+            const errorMessage = `Tool ${toolCall.name} is not registered.`;
+            conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: errorMessage });
+            failures.push(errorMessage);
+            await session.appendEvent('tool_error', { round, step, tool: toolCall.name, error: errorMessage });
+            continue;
+          }
+
+          const approved = await maybeApprove(
+            { sessionId: session.id, toolName: tool.name, approval: tool.approval, args: toolCall.args },
+            this.approvalHandler,
+            this.config.autoApprove,
+          );
+
+          if (!approved) {
+            const denied = `Tool ${tool.name} was denied by the user.`;
+            conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: denied });
+            blockedReasons.push(denied);
+            await session.appendEvent('tool_denied', { round, step, tool: tool.name, args: toolCall.args });
+            continue;
+          }
+
+          try {
+            const result = await tool.execute(toolCall.args, toolContext);
+            conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result.content });
+            if (result.artifactPath) {
+              artifacts.push(result.artifactPath);
+            }
+            roundEvidence.push(...buildEvidenceFromTool(tool.name, result.metadata, result.artifactPath));
+            await session.appendEvent('tool_result', {
+              round,
+              step,
+              tool: tool.name,
+              args: toolCall.args,
+              artifactPath: result.artifactPath,
+              metadata: result.metadata,
+            });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `Tool error: ${message}` });
+            failures.push(`${tool.name}: ${message}`);
+            await session.appendEvent('tool_error', { round, step, tool: tool.name, args: toolCall.args, error: message });
+          }
+        }
       }
 
-      if (turn.toolCalls.length === 0) {
-        finalMessage = turn.text || 'Task completed without additional output.';
+      if (!finalMessage) {
+        finalMessage = 'Reached the per-round tool step limit before the model produced a final answer.';
+      }
+      lastFinalMessage = finalMessage;
+
+      const diff = await session.renderDiff();
+      lastDiff = diff;
+      if (diff) {
+        const diffArtifact = await session.writeArtifact('workspace-diff.patch', diff);
+        artifacts.push(diffArtifact);
+        roundEvidence.push({
+          kind: 'diff',
+          summary: `Workspace diff captured for round ${round}.`,
+          artifactPath: diffArtifact,
+          passed: true,
+        });
+      }
+
+      const bundle: EvidenceBundle = {
+        task: prompt,
+        round,
+        backend: backend.name,
+        plan: roundPlan.planMarkdown,
+        finalMessage,
+        diff,
+        touchedFiles: session.touchedFiles(),
+        acceptanceChecks: roundPlan.acceptanceChecks,
+        requiredEvidence: roundPlan.requiredEvidence,
+        evidence: roundEvidence,
+        blockedReasons,
+        failures,
+      };
+
+      const verifierResult = await verifyWithFallback(this.ruleVerifier, this.modelVerifier, bundle);
+      finalVerifier = verifierResult;
+      previousVerifier = verifierResult;
+      lastArtifacts = artifacts;
+
+      await session.appendEvent('verifier_result', {
+        round,
+        backend: backend.name,
+        verifierResult,
+        evidenceArtifacts: artifacts,
+        acceptanceChecks: roundPlan.acceptanceChecks,
+      });
+
+      if (verifierResult.status === 'PASS' || verifierResult.status === 'BLOCKED') {
         break;
       }
-
-      for (const toolCall of turn.toolCalls) {
-        const tool = tools.find((candidate) => candidate.name === toolCall.name);
-        if (!tool) {
-          const errorMessage = `Tool ${toolCall.name} is not registered.`;
-          conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: errorMessage });
-          await session.appendEvent('tool_error', { tool: toolCall.name, error: errorMessage });
-          continue;
-        }
-
-        const approved = await maybeApprove(
-          { sessionId: session.id, toolName: tool.name, approval: tool.approval, args: toolCall.args },
-          this.approvalHandler,
-          this.config.autoApprove,
-        );
-
-        if (!approved) {
-          const denied = `Tool ${tool.name} was denied by the user.`;
-          conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: denied });
-          await session.appendEvent('tool_denied', { tool: tool.name, args: toolCall.args });
-          continue;
-        }
-
-        try {
-          const result = await tool.execute(toolCall.args, toolContext);
-          conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: result.content });
-          await session.appendEvent('tool_result', {
-            tool: tool.name,
-            args: toolCall.args,
-            artifactPath: result.artifactPath,
-          });
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          conversation.messages.push({ role: 'tool', tool_call_id: toolCall.id, content: `Tool error: ${message}` });
-          await session.appendEvent('tool_error', { tool: tool.name, args: toolCall.args, error: message });
-        }
-      }
     }
 
-    if (!finalMessage) {
-      finalMessage = 'Reached the tool step limit before the model produced a final answer.';
-    }
-
-    const diff = await session.renderDiff();
-    if (diff) {
-      await session.writeArtifact('workspace-diff.patch', diff);
-    }
-    const verification = diff
-      ? await this.model.generateText(
-          'You are verifying the result of a coding task. Summarize the observed diff, call out risks, and say whether the task looks complete.',
-          `Task:\n${prompt}\n\nPlan:\n${plan}\n\nDiff:\n${diff}`,
-        )
-      : 'No file changes were made during this session.';
-
-    await session.appendEvent('final', { finalMessage, verification });
-    await this.callbacks.onFinal?.(finalMessage);
+    await session.appendEvent('final', {
+      status: finalVerifier.status,
+      rounds: roundsUsed,
+      backend: lastBackend,
+      finalMessage: lastFinalMessage,
+      verification: finalVerifier.summary,
+      verifierResult: finalVerifier,
+      artifacts: lastArtifacts,
+    });
+    await this.callbacks.onFinal?.(lastFinalMessage);
 
     return {
       sessionId: session.id,
-      plan,
-      finalMessage,
-      verification,
-      diff,
+      status: finalVerifier.status,
+      rounds: roundsUsed,
+      backend: lastBackend,
+      plan: lastPlan,
+      finalMessage: lastFinalMessage,
+      verification: finalVerifier.summary,
+      verifierResult: finalVerifier,
+      diff: lastDiff,
+      artifacts: lastArtifacts,
     };
   }
 
   close(): void {
+    void this.backendFactory.close();
     this.index.close();
   }
 }

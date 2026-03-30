@@ -20,7 +20,14 @@ export function renderDoctorReport(config: AgencyConfig): string {
     `openai_model: ${config.openaiModel}`,
     `openai_embed_model: ${config.openaiEmbedModel}`,
     `openai_base_url: ${config.openaiBaseUrl ?? '(default)'}`,
+    `verifier_api_key: ${config.verifierApiKey ? 'configured' : 'missing'}`,
+    `verifier_model: ${config.verifierModel}`,
+    `verifier_base_url: ${config.verifierBaseUrl ?? '(default)'}`,
+    `default_backend: ${config.defaultBackend}`,
+    `e2b_api_key: ${config.e2bApiKey ? 'configured' : 'missing'}`,
     `auto_approve: ${config.autoApprove}`,
+    `max_execution_rounds: ${config.maxExecutionRounds}`,
+    `max_tool_steps_per_round: ${config.maxToolStepsPerRound}`,
     '',
     'commands:',
     `  git: ${hasCommand('git')}`,
@@ -36,6 +43,7 @@ export function renderDoctorReport(config: AgencyConfig): string {
     `  cache_exists: ${fs.existsSync(config.cacheDir)}`,
     `  env_local_present: ${fs.existsSync(path.join(config.rootDir, '.env.local'))}`,
     `  index_present: ${fs.existsSync(config.indexPath)}`,
+    `  python_env_present: ${fs.existsSync(path.join(config.cacheDir, 'python', '.venv', 'bin', 'python'))}`,
   ];
 
   if (!config.openaiApiKey) {

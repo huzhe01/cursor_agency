@@ -151,9 +151,13 @@ function uiHtml(): string {
             <div class="mono" id="artifacts"></div>
           </div>
           <div class="card">
-            <h3>Events</h3>
-            <div class="mono" id="events"></div>
+            <h3>Verifier</h3>
+            <div class="mono" id="verifier"></div>
           </div>
+        </div>
+        <div class="card">
+          <h3>Events</h3>
+          <div class="mono" id="events"></div>
         </div>
       </main>
     </div>
@@ -234,15 +238,20 @@ function uiHtml(): string {
         const detail = await api('/api/sessions/' + encodeURIComponent(id));
         selectedSessionId = detail.id;
         document.getElementById('detail-title').textContent = detail.prompt || '(empty prompt)';
-        document.getElementById('detail-meta').textContent = detail.id;
+        document.getElementById('detail-meta').textContent = detail.id + ' | rounds=' + (detail.rounds || 0) + ' | backend=' + (detail.backend || 'local');
         document.getElementById('detail-mode').textContent = detail.mode;
-        document.getElementById('detail-status').textContent = detail.taskStatus || 'unknown';
-        document.getElementById('detail-status').className = 'badge ' + (detail.taskStatus || '');
+        document.getElementById('detail-status').textContent = detail.status || detail.taskStatus || 'unknown';
+        document.getElementById('detail-status').className = 'badge ' + (detail.status || detail.taskStatus || '');
         document.getElementById('plan').textContent = detail.plan || '';
         document.getElementById('final').textContent = detail.finalMessage || '';
         document.getElementById('verification').textContent = detail.verification || '';
         document.getElementById('diff').textContent = detail.diff || '';
         document.getElementById('artifacts').textContent = (detail.artifacts || []).join('\n');
+        document.getElementById('verifier').textContent = JSON.stringify({
+          verifierResult: detail.verifierResult || null,
+          acceptanceChecks: detail.acceptanceChecks || [],
+          evidenceArtifacts: detail.evidenceArtifacts || [],
+        }, null, 2);
         document.getElementById('events').textContent = (detail.events || []).map((event) => JSON.stringify(event, null, 2)).join('\n\n');
       }
 
@@ -330,7 +339,7 @@ export async function startConsoleServer(_runtime: AgencyRuntime, config: Agency
         const sessions = await listSessions(config.sessionDir);
         sendJson(response, 200, sessions.map((session) => ({
           ...session,
-          taskStatus: tasks.get(session.id)?.status ?? 'completed',
+          taskStatus: tasks.get(session.id)?.status ?? session.status,
         })));
         return;
       }
@@ -341,7 +350,7 @@ export async function startConsoleServer(_runtime: AgencyRuntime, config: Agency
         sendJson(response, detail ? 200 : 404, detail ? {
           ...detail,
           pendingApprovals: approvalManager.list(sessionId),
-          taskStatus: tasks.get(sessionId)?.status ?? 'completed',
+          taskStatus: tasks.get(sessionId)?.status ?? detail.status,
           taskError: tasks.get(sessionId)?.error,
         } : { error: 'Session not found' });
         return;

@@ -3,7 +3,7 @@
   "private": true,
   "packageManager": "pnpm@10.0.0",
   "scripts": {
-    "bootstrap": "pnpm install && pnpm rebuild esbuild && (cd packages/indexer && npm rebuild better-sqlite3 --build-from-source)",
+    "bootstrap": "pnpm install && pnpm rebuild esbuild && (cd packages/indexer && npm rebuild better-sqlite3 --build-from-source) && bash scripts/bootstrap-python.sh",
     "agency": "tsx apps/cli/src/index.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",

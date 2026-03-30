@@ -14,6 +14,9 @@ export interface SessionSummary {
   mode: 'task' | 'chat';
   createdAt: string;
   prompt: string;
+  status: string;
+  rounds: number;
+  backend: string;
   finalMessage: string;
   verification: string;
   planPath: string;
@@ -25,6 +28,9 @@ export interface SessionDetail extends SessionSummary {
   events: SessionEvent[];
   diff: string;
   artifacts: string[];
+  verifierResult?: Record<string, unknown>;
+  acceptanceChecks: Array<Record<string, unknown>>;
+  evidenceArtifacts: string[];
 }
 
 export class SessionStore {
@@ -143,6 +149,9 @@ function extractSummary(id: string, sessionDir: string, events: SessionEvent[]):
     mode,
     createdAt: id.split('-').slice(0, 6).join('-'),
     prompt: typeof firstPrompt === 'string' ? firstPrompt : '',
+    status: typeof finalEvent?.payload.status === 'string' ? finalEvent.payload.status : 'completed',
+    rounds: typeof finalEvent?.payload.rounds === 'number' ? finalEvent.payload.rounds : 0,
+    backend: typeof finalEvent?.payload.backend === 'string' ? finalEvent.payload.backend : 'local',
     finalMessage: typeof finalEvent?.payload.finalMessage === 'string' ? finalEvent.payload.finalMessage : '',
     verification: typeof finalEvent?.payload.verification === 'string' ? finalEvent.payload.verification : '',
     planPath: path.join(sessionDir, 'plan.md'),
@@ -182,12 +191,16 @@ export async function readSessionDetail(rootDir: string, sessionRoot: string, se
     const diffArtifact = sortedArtifacts.find((artifact) => artifact === 'workspace-diff.patch')
       ?? [...sortedArtifacts].reverse().find((artifact) => artifact.endsWith('.patch'));
     const diff = diffArtifact ? await fs.readFile(path.join(sessionDir, 'artifacts', diffArtifact), 'utf8').catch(() => '') : '';
+    const verifierEvent = [...events].reverse().find((event) => event.type === 'verifier_result');
     return {
       ...summary,
       plan,
       events,
       diff,
       artifacts: sortedArtifacts.map((artifact) => path.relative(rootDir, path.join(sessionDir, 'artifacts', artifact))),
+      verifierResult: verifierEvent?.payload.verifierResult as Record<string, unknown> | undefined,
+      acceptanceChecks: Array.isArray(verifierEvent?.payload.acceptanceChecks) ? verifierEvent?.payload.acceptanceChecks as Array<Record<string, unknown>> : [],
+      evidenceArtifacts: Array.isArray(verifierEvent?.payload.evidenceArtifacts) ? verifierEvent?.payload.evidenceArtifacts as string[] : [],
     };
   } catch {
     return null;

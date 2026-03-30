@@ -12,10 +12,11 @@ The runtime is designed around a simple software engineering workflow:
 - A host-side wrapper script: `./agency`
 - A containerized development/runtime environment
 - A local code index built on `SQLite FTS + embedding rerank`
-- A tool-using agent runtime with approvals for write and shell actions
+- A verifier-driven agent runtime with approvals for write and shell actions
 - A persistent session/artifact store under `.agency/`
 - A CLI for task execution and interactive chat
 - A minimal web console for sessions, diff preview, and approval handling
+- Local Python + DuckDB analysis execution inside the containerized runtime
 
 ## Host Compatibility
 
@@ -110,6 +111,18 @@ ARK_ENDPOINT_ID=your-endpoint-id
 
 The runtime also accepts `OPENAI_*` variables directly when using Ark's OpenAI-compatible API.
 
+Optional verifier/backend settings:
+
+```env
+VERIFIER_API_KEY=
+VERIFIER_MODEL=
+VERIFIER_BASE_URL=
+AGENCY_MAX_EXECUTION_ROUNDS=3
+AGENCY_DEFAULT_BACKEND=local
+E2B_API_KEY=
+E2B_TEMPLATE_ID=
+```
+
 ### 2. Bootstrap the environment
 
 ```bash
@@ -121,6 +134,8 @@ This command:
 - builds the Docker image
 - installs workspace dependencies inside the container
 - prepares the local cache layout under `.cache/`
+- creates a project-local Python environment at `.cache/python/.venv`
+- installs `duckdb`, `pandas`, and `pyarrow` into that project-local environment
 
 ### 3. Check the runtime
 
@@ -338,11 +353,12 @@ The runtime is intentionally conservative.
 Current behavior:
 
 - retrieve indexed context first
-- generate a Markdown plan
+- generate a structured round plan with acceptance checks
 - execute tool calls iteratively
 - require approval for write and shell tools
-- capture workspace diff
-- run a verification pass at the end
+- collect evidence for each round
+- run rule-first verification after each round
+- replan when verification fails and stop only on `PASS` or `BLOCKED`
 
 Important tooling currently includes:
 
@@ -354,6 +370,10 @@ Important tooling currently includes:
 - `write_patch`
 - `apply_unified_patch`
 - `run_shell`
+- `run_python_script`
+- `run_duckdb_sql`
+- `inspect_table`
+- `assert_table_checks`
 - `read_diff`
 
 `apply_unified_patch` supports:
@@ -361,6 +381,13 @@ Important tooling currently includes:
 - single-file patch application
 - multi-file patch application
 - `dry_run` preview mode
+
+Data-analysis tooling supports:
+
+- Python script execution in the local container runtime
+- DuckDB SQL execution
+- table inspection
+- structured table assertions such as row count, exact columns, null checks, value ranges, and aggregate equality
 
 ## Web Console
 
@@ -453,12 +480,14 @@ This repository is a practical prototype, not a full commercial IDE agent.
 Included:
 
 - local indexing
-- plan/execute/verify loop
+- verifier-driven plan/execute/verify loop
 - tool calling
 - approvals
 - session persistence
 - CLI
 - minimal web console
+- Python + DuckDB analysis execution
+- optional E2B backend abstraction
 
 Not included yet:
 

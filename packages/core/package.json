@@ -8,6 +8,7 @@
   "dependencies": {
     "@agency/indexer": "workspace:*",
     "@agency/tools": "workspace:*",
+    "@e2b/code-interpreter": "^2.4.0",
     "diff": "^8.0.2",
     "openai": "^6.8.1"
   }
